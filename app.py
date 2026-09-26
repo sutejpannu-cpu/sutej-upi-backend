@@ -288,11 +288,76 @@ def download_preset(token):
     return send_file(filepath, as_attachment=True, download_name=product["file"])
 
 
+
+
+
 def build_download_url(email: str, product_id: str) -> str:
+    # Prefer R2: the Railway host has no preset ZIPs on local disk, so the
+    # legacy /download/<token> links would 404 there. Fall back to the local
+    # signed URL only for local dev (where preset-packs/ exists).
+    r2_url = build_r2_presigned_url(product_id)
+    if r2_url:
+        return r2_url
+    app.logger.warning(
+        "R2 presigned URL unavailable for %s; falling back to local signed URL",
+        product_id,
+    )
     base = os.environ.get("PUBLIC_BASE_URL", "https://sutej-upi-backend-production.up.railway.app")
     token = generate_download_token(email, product_id)
     return f"{base}/download/{token}"
 
+
+# --- R2 presigned downloads ---
+# The private Cloudflare R2 bucket holds the preset ZIPs; the Railway server
+# has none on local disk. Delivery links must therefore be time-limited
+# presigned R2 URLs, not /download/<token> links.
+# Required env vars: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.
+# Optional: R2_BUCKET (default "preset-packs"), R2_LINK_TTL_SECONDS
+# (default 7 days, matching the delivery email's "valid for 7 days").
+def _r2_client():
+    account_id = os.environ.get("R2_ACCOUNT_ID", "")
+    access_key = os.environ.get("R2_ACCESS_KEY_ID", "")
+    secret_key = os.environ.get("R2_SECRET_ACCESS_KEY", "")
+    if not (account_id and access_key and secret_key):
+        return None
+    import boto3
+    return boto3.client(
+        "s3",
+        endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com",
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name="auto",
+    )
+
+
+def build_r2_presigned_url(product_id):
+    """Return a presigned R2 GET URL for the product ZIP, or None when R2
+    isn't configured or the object isn't in the bucket."""
+    if product_id not in PRODUCTS:
+        return None
+    s3 = _r2_client()
+    if s3 is None:
+        return None
+    bucket = os.environ.get("R2_BUCKET", "preset-packs")
+    key = PRODUCTS[product_id]["file"]
+    try:
+        ttl = int(os.environ.get("R2_LINK_TTL_SECONDS", str(7 * 24 * 3600)))
+    except ValueError:
+        ttl = 7 * 24 * 3600
+    try:
+        s3.head_object(Bucket=bucket, Key=key)  # make sure the ZIP is there
+    except Exception as e:
+        app.logger.error("R2 object missing: %s/%s (%s)", bucket, key, e)
+        return None
+    try:
+        return s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=min(ttl, 7 * 24 * 3600),  # SigV4 presigns cap at 7 days
+        )
+    except Exception as e:
+        app.logger.error("R2 presign failed for %s: %s", key, e)
+        return None
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
