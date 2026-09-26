@@ -44,8 +44,6 @@ HOW TO INSTALL:
 3. Open Lightroom and import the presets
 4. Start creating!
 
-Need help? Just reply to this email and I'll sort you out.
-
 Enjoy!
 - Sutej Pannu
 https://sutejpannu.com
