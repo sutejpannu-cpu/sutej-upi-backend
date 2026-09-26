@@ -58,21 +58,42 @@ PRODUCTS = {
     "8081981702363": {"name": "Weddings Pack Bundle", "amount": 5999, "file": "weddings-pack-bundle.zip"},
     "8889955188955": {"name": "Weddings Pack Bundle Updated", "amount": 11999, "file": "weddings-pack-bundle-updated.zip"},
     "8890093863131": {"name": "Bundle & Save", "amount": 9999, "file": "bundle-and-save.zip"},
+
+
+
+
+
+
+
+
+# Coupon codes: code -> discount percentage
+# In production, these could come from environment variables or a database
+# THANKYOU2026: keep until its Shopify expiry (Sept 27, 2026 ~9:30 AM PDT), then remove
+# FALL10: fall promo, valid for the duration of the Sept 24 - Oct 4, 2026 ad run
 }
 
 PRESET_DIR = os.path.join(os.path.dirname(__file__), "preset-packs")
 
 
-# Coupon codes: code -> discount percentage
+
 COUPONS = {
-    "THANKYOU2026": 20,
+    "THANKYOU2026": 20, "FALL10": 10,
 }
+
+
+
 
 
 @app.route("/generate-link", methods=["POST"])
 def generate_link():
     """Generate a fresh Razorpay payment link for a preset purchase."""
     data = request.get_json(force=True, silent=True) or {}
+
+
+
+
+
+
     product_id = str(data.get("product_id", ""))
     email = data.get("email", "").strip()
     coupon = str(data.get("coupon", "")).strip().upper()
