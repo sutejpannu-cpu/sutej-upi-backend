@@ -5,18 +5,21 @@ Generates fresh Razorpay payment links and auto-delivers presets via email.
 Endpoints:
   POST /generate-link  {product_id, email} -> {payment_link}
   POST /webhook        Razorpay payment_link.paid events -> sends preset email
+  GET  /download/<token>  time-limited secure preset download
+  GET  /health
 """
 
 import os
 import hmac
 import hashlib
 import json
-from flask import Flask, request, jsonify
+import base64
+import time
+from flask import Flask, request, jsonify, send_file
 import requests
 from requests.auth import HTTPBasicAuth
 
 app = Flask(__name__)
-
 
 # CORS: allow the Showit/Shopify storefront to call the API from the browser
 @app.after_request
@@ -30,10 +33,15 @@ def _cors(response):
 @app.route("/webhook", methods=["OPTIONS"])
 def _cors_preflight():
     return ("", 204)
+
 # Config from environment
 RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
 RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
+
+# In-memory set of processed Razorpay payment-link IDs (idempotency).
+# NOTE: resets on restart; use Redis/DB for multi-instance production.
+_processed_payments = set()
 
 # Product ID -> {name, amount_inr, file}
 # Amounts in INR (must match Shopify India market prices)
@@ -56,7 +64,6 @@ PRESET_DIR = os.path.join(os.path.dirname(__file__), "preset-packs")
 
 
 # Coupon codes: code -> discount percentage
-# In production, these could come from environment variables or a database
 COUPONS = {
     "THANKYOU2026": 20,
 }
@@ -153,15 +160,27 @@ def webhook():
         notes = pl.get("notes", {})
         product_id = str(notes.get("product_id", ""))
         customer_email = pl.get("customer", {}).get("email", "")
+        payment_id = pl.get("id", "")
+
+        # Idempotency: skip if we've already processed this payment link
+        if payment_id in _processed_payments:
+            app.logger.info("Duplicate webhook ignored for %s", payment_id)
+            return jsonify({"status": "duplicate_ignored"}), 200
 
         if product_id not in PRODUCTS or not customer_email:
             app.logger.error("Webhook missing product/email: %s", notes)
             return jsonify({"status": "missing_data"}), 200
 
         product = PRODUCTS[product_id]
-        # Queue delivery (implemented via delivery module / external sender)
+        # Build a time-limited download link and email it
         from delivery import send_preset_email
-        send_preset_email(customer_email, product["name"], product["file"])
+        download_url = build_download_url(customer_email, product_id)
+        send_preset_email(customer_email, product["name"], download_url)
+        _processed_payments.add(payment_id)
+        app.logger.info(
+            "Delivered %s to %s (payment %s)",
+            product["name"], customer_email, payment_id,
+        )
         return jsonify({"status": "delivered"}), 200
     except Exception as e:
         app.logger.error("Webhook error: %s", e)
@@ -171,6 +190,70 @@ def webhook():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
+
+
+# --- Secure download links ---
+DOWNLOAD_LINK_TTL_SECONDS = 7 * 24 * 3600  # 7 days
+
+
+def _b64url_encode(s: str) -> str:
+    return base64.urlsafe_b64encode(s.encode()).decode().rstrip("=")
+
+
+def _b64url_decode(s: str) -> str:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)).decode()
+
+
+def generate_download_token(email: str, product_id: str) -> str:
+    expiry = int(time.time()) + DOWNLOAD_LINK_TTL_SECONDS
+    payload = f"{email}.{product_id}.{expiry}"
+    sig = hmac.new(
+        RAZORPAY_KEY_SECRET.encode(), payload.encode(), hashlib.sha256
+    ).hexdigest()
+    return f"{_b64url_encode(email)}.{product_id}.{expiry}.{sig}"
+
+
+def verify_download_token(token: str):
+    """Return (email, product_id) if valid and not expired, else None."""
+    try:
+        email_b64, product_id, expiry_s, sig = token.split(".")
+        email = _b64url_decode(email_b64)
+        expiry = int(expiry_s)
+    except Exception:
+        return None
+    if expiry < int(time.time()):
+        return None
+    payload = f"{email}.{product_id}.{expiry}"
+    expected = hmac.new(
+        RAZORPAY_KEY_SECRET.encode(), payload.encode(), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        return None
+    if product_id not in PRODUCTS:
+        return None
+    return email, product_id
+
+
+@app.route("/download/<token>", methods=["GET"])
+def download_preset(token):
+    """Serve a preset ZIP via a time-limited signed token."""
+    result = verify_download_token(token)
+    if not result:
+        return jsonify({"error": "Invalid or expired download link"}), 403
+    email, product_id = result
+    product = PRODUCTS[product_id]
+    filepath = os.path.join(PRESET_DIR, product["file"])
+    if not os.path.exists(filepath):
+        app.logger.error("Preset file missing for download: %s", product["file"])
+        return jsonify({"error": "File not available"}), 404
+    app.logger.info("Download served: %s -> %s", product["file"], email)
+    return send_file(filepath, as_attachment=True, download_name=product["file"])
+
+
+def build_download_url(email: str, product_id: str) -> str:
+    base = os.environ.get("PUBLIC_BASE_URL", "https://sutej-upi-backend-production.up.railway.app")
+    token = generate_download_token(email, product_id)
+    return f"{base}/download/{token}"
 
 
 if __name__ == "__main__":
