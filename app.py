@@ -17,6 +17,19 @@ from requests.auth import HTTPBasicAuth
 
 app = Flask(__name__)
 
+
+# CORS: allow the Showit/Shopify storefront to call the API from the browser
+@app.after_request
+def _cors(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    return response
+
+@app.route("/generate-link", methods=["OPTIONS"])
+@app.route("/webhook", methods=["OPTIONS"])
+def _cors_preflight():
+    return ("", 204)
 # Config from environment
 RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
