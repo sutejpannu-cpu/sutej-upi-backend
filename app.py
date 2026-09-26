@@ -42,12 +42,20 @@ PRODUCTS = {
 PRESET_DIR = os.path.join(os.path.dirname(__file__), "preset-packs")
 
 
+# Coupon codes: code -> discount percentage
+# In production, these could come from environment variables or a database
+COUPONS = {
+    "THANKYOU2026": 20,
+}
+
+
 @app.route("/generate-link", methods=["POST"])
 def generate_link():
     """Generate a fresh Razorpay payment link for a preset purchase."""
     data = request.get_json(force=True, silent=True) or {}
     product_id = str(data.get("product_id", ""))
     email = data.get("email", "").strip()
+    coupon = str(data.get("coupon", "")).strip().upper()
 
     if product_id not in PRODUCTS:
         return jsonify({"error": "Unknown product"}), 400
@@ -57,17 +65,37 @@ def generate_link():
         return jsonify({"error": "Payment service not configured"}), 500
 
     product = PRODUCTS[product_id]
-    amount_paise = product["amount"] * 100
+    amount_inr = product["amount"]
+
+    # Apply coupon discount if valid
+    discount_pct = 0
+    if coupon:
+        if coupon in COUPONS:
+            discount_pct = COUPONS[coupon]
+            amount_inr = int(round(amount_inr * (100 - discount_pct) / 100))
+        else:
+            return jsonify({"error": "Invalid coupon code"}), 400
+
+    amount_paise = amount_inr * 100
+
+    description = product["name"] + " - Sutej Pannu"
+    if discount_pct:
+        description += f" ({discount_pct}% off with {coupon})"
 
     payload = {
         "amount": amount_paise,
         "currency": "INR",
         "accept_partial": False,
-        "description": product["name"] + " - Sutej Pannu",
+        "description": description,
         "customer": {"email": email},
         "notify": {"sms": True, "email": True},
         "reminder_enable": True,
-        "notes": {"product_id": product_id, "product_name": product["name"]},
+        "notes": {
+            "product_id": product_id,
+            "product_name": product["name"],
+            "coupon": coupon if discount_pct else "",
+            "discount_pct": str(discount_pct),
+        },
         "callback_url": "https://sutejpannu.com/shop",
         "callback_method": "get",
     }
