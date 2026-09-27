@@ -477,7 +477,7 @@ def sweep():
             app.logger.error("Sweep delivery failed for %s: %s", link_id, e)
     return jsonify({
         "status": "ok",
-        "checked": len(links),
+        "checked": len(links), "dbg_raw_count": len(resp.json().get("items", [])), "dbg_sample": [[l.get("id"), l.get("status"), l.get("created_at")] for l in resp.json().get("items", [])][:5],
         "delivered": delivered,
         "already_done": already_done,
     })
