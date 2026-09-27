@@ -84,6 +84,52 @@ def _mark_delivered(link_id):
     ids.add(link_id)
     _save_delivered(ids)
 
+
+# --- Generated payment-link records ---
+# Every link minted by /generate-link is recorded here (link id, product,
+# buyer email, amount). The /v1/payment_links LIST API returns no items for
+# this account (verified), so the sweeper reconciles against /v1/payments
+# instead and maps each captured payment back to its product via the
+# payment's notes (copied from the link) with this file as fallback.
+# Container-local like delivered.json; Postgres is the planned durable home.
+_GENERATED_FILE = os.path.join(os.path.dirname(__file__), "generated_links.json")
+
+
+def _load_generated():
+    try:
+        with open(_GENERATED_FILE) as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+    except (OSError, ValueError):
+        pass
+    return []
+
+
+def _record_generated_link(link_id, product_id, email, amount_paise):
+    try:
+        records = _load_generated()
+        records.append({
+            "link_id": link_id,
+            "product_id": str(product_id),
+            "email": email,
+            "amount": int(amount_paise),
+            "created_at": int(time.time()),
+        })
+        records = records[-500:]  # keep the file bounded
+        with open(_GENERATED_FILE, "w") as f:
+            json.dump(records, f)
+    except OSError as e:
+        app.logger.error("Could not save generated_links.json: %s", e)
+
+
+def _find_generated_record(email, amount_paise):
+    """Most recent generated-link record matching buyer email + amount."""
+    for rec in reversed(_load_generated()):
+        if rec.get("email") == email and int(rec.get("amount") or 0) == int(amount_paise):
+            return rec
+    return None
+
 # Product ID -> {name, amount_inr, file}
 # Amounts in INR (must match Shopify India market prices)
 PRODUCTS = {
@@ -208,6 +254,7 @@ def generate_link():
         "notes": {
             "product_id": product_id,
             "product_name": product["name"],
+            "email": email,
             "coupon": coupon if (discount_pct or one_time_deal) else "",
             "discount_pct": str(discount_pct),
             "phone": phone,
@@ -228,6 +275,11 @@ def generate_link():
         short_url = link_data.get("short_url")
         if not short_url:
             return jsonify({"error": "No payment link returned"}), 500
+        # Record the minted link so the reconciler can map the later payment
+        # back to product/email even if the payment-link list API stays empty.
+        link_id = link_data.get("id", "")
+        if link_id:
+            _record_generated_link(link_id, product_id, email, amount_paise)
         return jsonify({"payment_link": short_url})
     except requests.RequestException as e:
         app.logger.error("Razorpay API error: %s", e)
@@ -257,6 +309,9 @@ def webhook():
         product_id = str(notes.get("product_id", ""))
         customer_email = pl.get("customer", {}).get("email", "")
         payment_id = pl.get("id", "")
+        # The actual Razorpay payment id (sweeper keys off this).
+        pay_entity = (event["payload"].get("payment") or {}).get("entity") or {}
+        razorpay_payment_id = pay_entity.get("id", "")
 
         # Idempotency: skip if we've already processed this payment link
         if _already_delivered(payment_id):
@@ -273,6 +328,8 @@ def webhook():
         download_url = build_download_url(customer_email, product_id)
         send_preset_email(customer_email, product["name"], download_url)
         _mark_delivered(payment_id)
+        if razorpay_payment_id:
+            _mark_delivered(razorpay_payment_id)
         app.logger.info(
             "Delivered %s to %s (payment %s)",
             product["name"], customer_email, payment_id,
@@ -311,7 +368,6 @@ def tracker_payments():
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     day_start_ts = int(day_start.timestamp())
     now_ts = int(now.timestamp())
-    week_ago_ts = day_start_ts - 6 * 86400  # catch links created earlier, paid today
 
     def _api_get(url, params):
         try:
@@ -327,27 +383,25 @@ def tracker_payments():
     # Razorpay's payment page, right after our email box.
     pay_to_item = {}
     pay_to_contact = {}
-    links_data = _api_get(
-        "https://api.razorpay.com/v1/payment_links",
-        {"count": 100},
-    )
-    if links_data:
-        for link in [l for l in links_data.get("items", []) if week_ago_ts <= int(l.get("created_at", 0) or 0) <= now_ts]:  # client-side date filter: list API ignores from/to
-            pay_ids = link.get("payments") or []
-            detail = None
-            if not pay_ids and link.get("status") == "paid" and link.get("id"):
-                detail = _api_get(
-                    "https://api.razorpay.com/v1/payment_links/" + link["id"], {}
-                )
-                pay_ids = (detail or {}).get("payments") or []
-            notes = link.get("notes", {}) or {}
-            name = notes.get("product_name") or link.get("description") or "Preset"
-            cust = ((detail or {}).get("customer") or link.get("customer") or {}) or {}
-            contact = cust.get("contact", "")
-            for pid in pay_ids:
-                pay_to_item[pid] = name
-                if contact:
-                    pay_to_contact[pid] = contact
+    # NOTE: the /v1/payment_links LIST API returns zero items for this
+    # account (verified 2026-09-27), so mapping is done from each payment's
+    # own fields instead. /generate-link stamps product notes on the link,
+    # which Razorpay copies onto the payment; generated_links.json backs it up.
+    def _map_payment(p):
+        notes = p.get("notes") or {}
+        product_id = str(notes.get("product_id") or "")
+        email = (p.get("email") or "").strip()
+        amount_paise = int(p.get("amount") or 0)
+        if product_id not in PRODUCTS and email and amount_paise:
+            rec = _find_generated_record(email, amount_paise)
+            if rec:
+                product_id = rec.get("product_id", "")
+        item = (
+            PRODUCTS.get(product_id, {}).get("name")
+            or notes.get("product_name")
+            or "UPI payment"
+        )
+        return item, p.get("contact") or ""
 
     # Today's captured payments (mirrors the dashboard payments view).
     pays_data = _api_get(
@@ -364,11 +418,12 @@ def tracker_payments():
         pid = p.get("id", "")
         created = int(p.get("created_at", 0))
         dt = datetime.fromtimestamp(created, TRACKER_TZ)
+        item, contact = _map_payment(p)
         payments.append({
             "time": dt.strftime("%H:%M"),
             "payment_id": pid,
-            "item": pay_to_item.get(pid, "UPI payment"),
-            "contact": pay_to_contact.get(pid, ""),
+            "item": item,
+            "contact": contact,
             "amount": (p.get("amount") or 0) // 100,
             "status": p.get("status", ""),
             "created_at": created,
@@ -385,9 +440,11 @@ def tracker_payments():
 
 # --- Payment reconciliation sweeper ---
 # Safety net for the webhook: every few minutes this checks Razorpay for
-# payment links that were PAID but never delivered (webhook never fired,
-# failed, or the server was down). Any missed preset gets its download email
-# here, so no paid order can silently go undelivered.
+# CAPTURED payments from the last 48h that were never delivered (webhook
+# never fired, failed, or the server was down). Any missed preset gets its
+# download email here, so no paid order can silently go undelivered.
+# Reconciles against /v1/payments (proven reliable) because the
+# /v1/payment_links LIST API returns zero items for this account.
 # Called by a scheduled job; guarded by the same TRACKER_KEY secret.
 @app.route("/sweep", methods=["GET"])
 def sweep():
@@ -399,87 +456,76 @@ def sweep():
 
     auth = HTTPBasicAuth(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)
     now_ts = int(time.time())
-    from_ts = now_ts - 48 * 3600  # only recent links; older ones were handled
+    from_ts = now_ts - 48 * 3600  # only recent payments; older ones were handled
 
     try:
         resp = requests.get(
-            "https://api.razorpay.com/v1/payment_links",
+            "https://api.razorpay.com/v1/payments",
             auth=auth,
-            params={"count": 100},
+            params={"from": from_ts, "to": now_ts, "count": 100},
             timeout=30,
         )
         resp.raise_for_status()
-        links = [l for l in resp.json().get("items", []) if from_ts <= int(l.get("created_at", 0) or 0) <= now_ts]  # client-side filter: list API ignores from/to
+        payments = resp.json().get("items", [])
     except requests.RequestException as e:
         app.logger.error("Sweep: Razorpay API error: %s", e)
         return jsonify({"error": "razorpay unavailable"}), 502
 
     from delivery import send_preset_email
-    delivered, already_done = [], 0
-    for link in links:
-        if link.get("status") != "paid":
+    delivered, already_done, skipped = [], 0, 0
+    for p in payments:
+        if p.get("status") != "captured":
             continue
-        link_id = link.get("id", "")
-        if not link_id or _already_delivered(link_id):
+        # Fully refunded payments need no delivery.
+        amount_paise = int(p.get("amount") or 0)
+        if amount_paise and int(p.get("amount_refunded") or 0) >= amount_paise:
+            continue
+        pay_id = p.get("id", "")
+        if not pay_id or _already_delivered(pay_id):
             already_done += 1
             continue
-        # The buyer types their contact on Razorpay's payment page (the step
-        # right after our email box). Pull the full link detail so we capture
-        # that contact alongside the email for tracking/reconciliation.
-        customer = link.get("customer") or {}
-        pay_ids = link.get("payments") or []
-        try:
-            d = requests.get(
-                "https://api.razorpay.com/v1/payment_links/" + link_id,
-                auth=auth, timeout=30,
-            )
-            detail = d.json() if d.ok else {}
-        except requests.RequestException:
-            detail = {}
-        d_customer = detail.get("customer") or {}
-        if d_customer.get("email"):
-            customer = d_customer
-        pay_ids = detail.get("payments") or pay_ids
-        contact = d_customer.get("contact") or customer.get("contact") or ""
-        # Last resort: the payment entity always carries the payer's contact.
-        if not contact and pay_ids:
-            try:
-                p = requests.get(
-                    "https://api.razorpay.com/v1/payments/" + pay_ids[0],
-                    auth=auth, timeout=30,
-                )
-                if p.ok:
-                    contact = p.json().get("contact") or ""
-            except requests.RequestException:
-                pass
-        notes = link.get("notes") or {}
-        product_id = str(notes.get("product_id", ""))
-        customer_email = customer.get("email", "")
+        # Map the payment back to product + buyer. Primary: notes stamped by
+        # /generate-link (Razorpay copies link notes onto the payment).
+        # Fallback: the generated_links.json record matched on email + amount.
+        notes = p.get("notes") or {}
+        product_id = str(notes.get("product_id") or "")
+        customer_email = (p.get("email") or "").strip() or str(notes.get("email") or "")
+        contact = p.get("contact") or ""
+        link_id = ""
+        if product_id not in PRODUCTS and customer_email and amount_paise:
+            rec = _find_generated_record(customer_email, amount_paise)
+            if rec:
+                product_id = rec.get("product_id", "")
+                link_id = rec.get("link_id", "")
         if product_id not in PRODUCTS or not customer_email:
-            app.logger.warning("Sweep: missing product/email on %s", link_id)
+            app.logger.warning("Sweep: cannot map payment %s to product/email", pay_id)
+            skipped += 1
             continue  # not marked delivered; retried on the next sweep
         try:
             product = PRODUCTS[product_id]
             download_url = build_download_url(customer_email, product_id)
             send_preset_email(customer_email, product["name"], download_url)
-            _mark_delivered(link_id)
+            _mark_delivered(pay_id)
+            if link_id:
+                _mark_delivered(link_id)
             delivered.append({
-                "link": link_id,
+                "payment": pay_id,
                 "product": product["name"],
                 "email": customer_email,
                 "phone": contact or str(notes.get("phone", "")),
             })
             app.logger.info(
-                "Sweep delivered %s to %s (%s)",
-                product["name"], customer_email, link_id,
+                "Sweep delivered %s to %s (payment %s)",
+                product["name"], customer_email, pay_id,
             )
         except Exception as e:
-            app.logger.error("Sweep delivery failed for %s: %s", link_id, e)
+            app.logger.error("Sweep delivery failed for %s: %s", pay_id, e)
     return jsonify({
         "status": "ok",
-        "checked": len(links), "dbg_raw_count": len(resp.json().get("items", [])), "dbg_sample": [[l.get("id"), l.get("status"), l.get("created_at")] for l in resp.json().get("items", [])][:5],
+        "checked": len(payments),
         "delivered": delivered,
         "already_done": already_done,
+        "skipped": skipped,
     })
 
 
