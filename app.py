@@ -18,6 +18,8 @@ import time
 from flask import Flask, request, jsonify, send_file
 import requests
 from requests.auth import HTTPBasicAuth
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
@@ -230,6 +232,104 @@ def health():
     return jsonify({"status": "ok"})
 
 
+
+# --- Tracker payments proxy ---
+# Lets the Clicker App tracker read today's successful UPI payments without
+# opening the Razorpay dashboard in a browser (which triggers a per-task
+# approval prompt on Sutej's phone every 15 minutes). Read-only: proxies the
+# Razorpay Payment Links API using the server's own API keys.
+# Guarded by the TRACKER_KEY env var (shared secret with the tracker).
+TRACKER_KEY = os.environ.get("TRACKER_KEY", "")
+TRACKER_TZ = ZoneInfo("America/Los_Angeles")
+
+
+@app.route("/tracker/payments", methods=["GET"])
+def tracker_payments():
+    key = request.args.get("key", "")
+    if not TRACKER_KEY or not hmac.compare_digest(key, TRACKER_KEY):
+        return jsonify({"error": "unauthorized"}), 401
+    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+        return jsonify({"error": "payment service not configured"}), 502
+
+    auth = HTTPBasicAuth(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)
+    now = datetime.now(TRACKER_TZ)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_start_ts = int(day_start.timestamp())
+    now_ts = int(now.timestamp())
+    week_ago_ts = day_start_ts - 6 * 86400
+
+    try:
+        links_resp = requests.get(
+            "https://api.razorpay.com/v1/payment_links",
+            auth=auth,
+            params={"from": week_ago_ts, "to": now_ts, "count": 100},
+            timeout=30,
+        )
+        links_resp.raise_for_status()
+        items = links_resp.json().get("items", [])
+    except requests.RequestException as e:
+        app.logger.error("Razorpay payment_links fetch failed: %s", e)
+        return jsonify({"error": "razorpay api unavailable"}), 502
+
+    def _get_payment(pid):
+        try:
+            pr = requests.get(
+                f"https://api.razorpay.com/v1/payments/{pid}",
+                auth=auth,
+                timeout=30,
+            )
+            pr.raise_for_status()
+            return pr.json()
+        except requests.RequestException as e:
+            app.logger.error("Razorpay payment fetch failed %s: %s", pid, e)
+            return None
+
+    def _link_payment_ids(link):
+        pay_ids = link.get("payments") or []
+        if pay_ids or link.get("status") != "paid":
+            return pay_ids
+        try:
+            lr = requests.get(
+                f"https://api.razorpay.com/v1/payment_links/{link.get('id')}",
+                auth=auth,
+                timeout=30,
+            )
+            lr.raise_for_status()
+            return lr.json().get("payments") or []
+        except requests.RequestException as e:
+            app.logger.error("Razorpay payment_link detail failed: %s", e)
+            return []
+
+    payments = []
+    for link in items:
+        if link.get("status") != "paid":
+            continue
+        notes = link.get("notes", {}) or {}
+        item_name = notes.get("product_name") or link.get("description") or "Preset"
+        for pid in _link_payment_ids(link):
+            p = _get_payment(pid)
+            if not p or p.get("status") != "captured":
+                continue
+            created = int(p.get("created_at", 0))
+            if created < day_start_ts:
+                continue
+            dt = datetime.fromtimestamp(created, TRACKER_TZ)
+            payments.append({
+                "time": dt.strftime("%H:%M"),
+                "payment_id": p.get("id", ""),
+                "item": item_name,
+                "amount": (p.get("amount") or 0) // 100,
+                "status": p.get("status", ""),
+                "created_at": created,
+            })
+
+    payments.sort(key=lambda x: x["created_at"])
+    return jsonify({
+        "date": day_start.strftime("%Y-%m-%d"),
+        "count": len(payments),
+        "total_inr": sum(x["amount"] for x in payments),
+        "payments": payments,
+    })
 # --- Secure download links ---
 DOWNLOAD_LINK_TTL_SECONDS = 7 * 24 * 3600  # 7 days
 
