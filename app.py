@@ -590,6 +590,22 @@ def sweep():
     })
 
 
+@app.route("/delivery-status", methods=["GET"])
+def delivery_status():
+    """Check whether a Razorpay payment was already delivered (webhook or sweep).
+
+    Used by the payment watcher: a Razorpay “Payment successful” email means a
+    real captured payment, and this confirms the buyer actually got the preset.
+    """
+    key = request.args.get("key", "")
+    if not TRACKER_KEY or not hmac.compare_digest(key, TRACKER_KEY):
+        return jsonify({"error": "unauthorized"}), 401
+    pay_id = (request.args.get("payment_id") or "").strip()
+    if not pay_id:
+        return jsonify({"error": "payment_id required"}), 400
+    return jsonify({"payment_id": pay_id, "delivered": _already_delivered(pay_id)})
+
+
 # --- Secure download links ---
 DOWNLOAD_LINK_TTL_SECONDS = 7 * 24 * 3600  # 7 days
 
