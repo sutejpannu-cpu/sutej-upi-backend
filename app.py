@@ -304,7 +304,7 @@ def tracker_payments():
         payments.append({
             "time": dt.strftime("%H:%M"),
             "payment_id": pid,
-            "item": pay_to_item.get(pid) or p.get("description") or "UPI payment",
+            "item": pay_to_item.get(pid, "UPI payment"),
             "amount": (p.get("amount") or 0) // 100,
             "status": p.get("status", ""),
             "created_at": created,
