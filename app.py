@@ -57,9 +57,9 @@ PRODUCTS = {
     "8081981735131": {"name": "Portrait Pack Bundle", "amount": 2199, "file": "portrait-pack-bundle.zip"},
     "8889942376667": {"name": "Nostalgic Tones Lightroom Preset", "amount": 5999, "file": "nostalgic-tones-preset.zip"},
     "8889950961883": {"name": "Mystic Tones Lightroom Preset", "amount": 5999, "file": "mystic-tones-preset.zip"},
-    "8081981702363": {"name": "Weddings Pack Bundle", "amount": 5999, "file": "weddings-pack-bundle.zip"},
-    "8889955188955": {"name": "Weddings Pack Bundle Updated", "amount": 11999, "file": "weddings-pack-bundle-updated.zip"},
-    "8890093863131": {"name": "Bundle & Save", "amount": 9999, "file": "bundle-and-save.zip"},
+    "8081981702363": {"name": "Weddings Pack Bundle Updated", "amount": 11999, "file": "weddings-pack-bundle-updated.zip"},
+    "8889955188955": {"name": "Weddings Pack Bundle", "amount": 5999, "file": "weddings-pack-bundle.zip"},
+    "8890093863131": {"name": "Bundle & Save Updated", "amount": 14999, "file": "bundle-and-save-updated.zip"},
 
 
 
