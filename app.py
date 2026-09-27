@@ -473,6 +473,7 @@ def sweep():
 
     from delivery import send_preset_email
     delivered, already_done, skipped = [], 0, 0
+    skipped_details = []  # captured-but-unmappable payments, for manual review
     for p in payments:
         if p.get("status") != "captured":
             continue
@@ -500,6 +501,15 @@ def sweep():
         if product_id not in PRODUCTS or not customer_email:
             app.logger.warning("Sweep: cannot map payment %s to product/email", pay_id)
             skipped += 1
+            skipped_details.append({
+                "payment_id": pay_id,
+                "amount": amount_paise,
+                "method": p.get("method"),
+                "created_at": p.get("created_at"),
+                "email": customer_email or None,
+                "contact": contact or None,
+                "notes": notes,
+            })
             continue  # not marked delivered; retried on the next sweep
         try:
             product = PRODUCTS[product_id]
@@ -526,6 +536,7 @@ def sweep():
         "delivered": delivered,
         "already_done": already_done,
         "skipped": skipped,
+        "skipped_details": skipped_details,
     })
 
 
