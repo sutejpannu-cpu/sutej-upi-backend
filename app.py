@@ -2,14 +2,12 @@
 UPI Payment Backend for Sutej Pannu Presets
 Generates fresh Razorpay payment links and auto-delivers presets via email.
 
-
 Endpoints:
   POST /generate-link  {product_id, email} -> {payment_link}
   POST /webhook        Razorpay payment_link.paid events -> sends preset email
   GET  /download/<token>  time-limited secure preset download
   GET  /health
 """
-
 
 import os
 import hmac
@@ -23,7 +21,6 @@ from requests.auth import HTTPBasicAuth
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-
 app = Flask(__name__)
 
 # CORS: allow the Showit/Shopify storefront to call the API from the browser
@@ -34,23 +31,19 @@ def _cors(response):
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
 
-
 @app.route("/generate-link", methods=["OPTIONS"])
 @app.route("/webhook", methods=["OPTIONS"])
 def _cors_preflight():
     return ("", 204)
-
 
 # Config from environment
 RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
 RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
 
-
 # In-memory set of processed Razorpay payment-link IDs (idempotency).
 # NOTE: resets on restart; use Redis/DB for multi-instance production.
 _processed_payments = set()
-
 
 # Product ID -> {name, amount_inr, file}
 # Amounts in INR (must match Shopify India market prices)
@@ -74,6 +67,7 @@ PRODUCTS = {
 
 
 
+
 # Coupon codes: code -> discount percentage
 # In production, these could come from environment variables or a database
 # THANKYOU2026: keep until its Shopify expiry (Sept 27, 2026 ~9:30 AM PDT), then remove
@@ -81,6 +75,7 @@ PRODUCTS = {
 }
 
 PRESET_DIR = os.path.join(os.path.dirname(__file__), "preset-packs")
+
 
 
 COUPONS = {
@@ -97,10 +92,13 @@ _used_one_time_coupons = set()
 
 
 
+
 @app.route("/generate-link", methods=["POST"])
 def generate_link():
     """Generate a fresh Razorpay payment link for a preset purchase."""
     data = request.get_json(force=True, silent=True) or {}
+
+
 
 
 
@@ -232,6 +230,7 @@ def webhook():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
+
 
 
 # --- Tracker payments proxy ---
@@ -375,6 +374,8 @@ def download_preset(token):
         return jsonify({"error": "File not available"}), 404
     app.logger.info("Download served: %s -> %s", product["file"], email)
     return send_file(filepath, as_attachment=True, download_name=product["file"])
+
+
 
 
 
