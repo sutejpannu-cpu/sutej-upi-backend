@@ -15,6 +15,8 @@ import hashlib
 import json
 import base64
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, send_file
 import requests
 from requests.auth import HTTPBasicAuth
@@ -41,9 +43,46 @@ RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
 RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
 
-# In-memory set of processed Razorpay payment-link IDs (idempotency).
-# NOTE: resets on restart; use Redis/DB for multi-instance production.
+# Set of processed Razorpay payment-link IDs (idempotency, in-memory).
 _processed_payments = set()
+
+# Persistent record of delivered payment-link IDs. Survives restarts within a
+# container and ships with the repo (delivered.json). The /sweep job shares
+# this with the webhook handler so a paid link is delivered exactly once, no
+# matter which path gets there first.
+_DELIVERED_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "delivered.json"
+)
+
+
+def _load_delivered():
+    try:
+        with open(_DELIVERED_FILE) as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return set(data)
+    except (OSError, ValueError):
+        pass
+    return set()
+
+
+def _save_delivered(ids):
+    try:
+        with open(_DELIVERED_FILE, "w") as f:
+            json.dump(sorted(ids), f)
+    except OSError as e:
+        app.logger.error("Could not save delivered.json: %s", e)
+
+
+def _already_delivered(link_id):
+    return link_id in _processed_payments or link_id in _load_delivered()
+
+
+def _mark_delivered(link_id):
+    _processed_payments.add(link_id)
+    ids = _load_delivered()
+    ids.add(link_id)
+    _save_delivered(ids)
 
 # Product ID -> {name, amount_inr, file}
 # Amounts in INR (must match Shopify India market prices)
@@ -60,6 +99,7 @@ PRODUCTS = {
     "8081981702363": {"name": "Weddings Pack Bundle Updated", "amount": 11999, "file": "weddings-pack-bundle-updated.zip"},
     "8889955188955": {"name": "Weddings Pack Bundle", "amount": 5999, "file": "weddings-pack-bundle.zip"},
     "8890093863131": {"name": "Bundle & Save Updated", "amount": 14999, "file": "bundle-and-save-updated.zip"},
+}
 
 
 
@@ -106,11 +146,23 @@ def generate_link():
     product_id = str(data.get("product_id", ""))
     email = data.get("email", "").strip()
     coupon = str(data.get("coupon", "")).strip().upper()
+    phone_raw = str(data.get("phone", "") or "")
 
     if product_id not in PRODUCTS:
         return jsonify({"error": "Unknown product"}), 400
     if not email or "@" not in email:
         return jsonify({"error": "Valid email required"}), 400
+
+    # Optional UPI contact number: normalize Indian 10-digit mobiles to +91.
+    # Invalid input is ignored (never blocks the purchase).
+    phone_digits = "".join(c for c in phone_raw if c.isdigit())
+    phone = ""
+    if len(phone_digits) == 10 and phone_digits[0] in "6789":
+        phone = "+91" + phone_digits
+    elif len(phone_digits) == 12 and phone_digits.startswith("91"):
+        phone = "+" + phone_digits
+    elif phone_raw.strip().startswith("+") and 7 <= len(phone_digits) <= 15:
+        phone = "+" + phone_digits
     if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
         return jsonify({"error": "Payment service not configured"}), 500
 
@@ -142,12 +194,16 @@ def generate_link():
     elif discount_pct:
         description += f" ({discount_pct}% off with {coupon})"
 
+    customer = {"email": email}
+    if phone:
+        customer["contact"] = phone
+
     payload = {
         "amount": amount_paise,
         "currency": "INR",
         "accept_partial": False,
         "description": description,
-        "customer": {"email": email},
+        "customer": customer,
         "notify": {"sms": True, "email": True},
         "reminder_enable": True,
         "notes": {
@@ -155,6 +211,7 @@ def generate_link():
             "product_name": product["name"],
             "coupon": coupon if (discount_pct or one_time_deal) else "",
             "discount_pct": str(discount_pct),
+            "phone": phone,
         },
         "callback_url": "https://sutejpannu.com/shop",
         "callback_method": "get",
@@ -203,7 +260,7 @@ def webhook():
         payment_id = pl.get("id", "")
 
         # Idempotency: skip if we've already processed this payment link
-        if payment_id in _processed_payments:
+        if _already_delivered(payment_id):
             app.logger.info("Duplicate webhook ignored for %s", payment_id)
             return jsonify({"status": "duplicate_ignored"}), 200
 
@@ -216,7 +273,7 @@ def webhook():
         from delivery import send_preset_email
         download_url = build_download_url(customer_email, product_id)
         send_preset_email(customer_email, product["name"], download_url)
-        _processed_payments.add(payment_id)
+        _mark_delivered(payment_id)
         app.logger.info(
             "Delivered %s to %s (payment %s)",
             product["name"], customer_email, payment_id,
@@ -230,7 +287,6 @@ def webhook():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
-
 
 
 # --- Tracker payments proxy ---
@@ -267,8 +323,11 @@ def tracker_payments():
             app.logger.error("Razorpay API failed %s: %s", url, e)
             return None
 
-    # Map payment_id -> preset name via recent payment links (built by /generate-link).
+    # Map payment_id -> preset name + payer contact via recent payment links
+    # (built by /generate-link). The contact is what the buyer typed on
+    # Razorpay's payment page, right after our email box.
     pay_to_item = {}
+    pay_to_contact = {}
     links_data = _api_get(
         "https://api.razorpay.com/v1/payment_links",
         {"from": week_ago_ts, "to": now_ts, "count": 100},
@@ -276,6 +335,7 @@ def tracker_payments():
     if links_data:
         for link in links_data.get("items", []):
             pay_ids = link.get("payments") or []
+            detail = None
             if not pay_ids and link.get("status") == "paid" and link.get("id"):
                 detail = _api_get(
                     "https://api.razorpay.com/v1/payment_links/" + link["id"], {}
@@ -283,8 +343,12 @@ def tracker_payments():
                 pay_ids = (detail or {}).get("payments") or []
             notes = link.get("notes", {}) or {}
             name = notes.get("product_name") or link.get("description") or "Preset"
+            cust = ((detail or {}).get("customer") or link.get("customer") or {}) or {}
+            contact = cust.get("contact", "")
             for pid in pay_ids:
                 pay_to_item[pid] = name
+                if contact:
+                    pay_to_contact[pid] = contact
 
     # Today's captured payments (mirrors the dashboard payments view).
     pays_data = _api_get(
@@ -305,6 +369,7 @@ def tracker_payments():
             "time": dt.strftime("%H:%M"),
             "payment_id": pid,
             "item": pay_to_item.get(pid, "UPI payment"),
+            "contact": pay_to_contact.get(pid, ""),
             "amount": (p.get("amount") or 0) // 100,
             "status": p.get("status", ""),
             "created_at": created,
@@ -317,6 +382,107 @@ def tracker_payments():
         "total_inr": sum(x["amount"] for x in payments),
         "payments": payments,
     })
+
+
+# --- Payment reconciliation sweeper ---
+# Safety net for the webhook: every few minutes this checks Razorpay for
+# payment links that were PAID but never delivered (webhook never fired,
+# failed, or the server was down). Any missed preset gets its download email
+# here, so no paid order can silently go undelivered.
+# Called by a scheduled job; guarded by the same TRACKER_KEY secret.
+@app.route("/sweep", methods=["GET"])
+def sweep():
+    key = request.args.get("key", "")
+    if not TRACKER_KEY or not hmac.compare_digest(key, TRACKER_KEY):
+        return jsonify({"error": "unauthorized"}), 401
+    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+        return jsonify({"error": "payment service not configured"}), 502
+
+    auth = HTTPBasicAuth(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)
+    now_ts = int(time.time())
+    from_ts = now_ts - 48 * 3600  # only recent links; older ones were handled
+
+    try:
+        resp = requests.get(
+            "https://api.razorpay.com/v1/payment_links",
+            auth=auth,
+            params={"from": from_ts, "to": now_ts, "count": 100},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        links = resp.json().get("items", [])
+    except requests.RequestException as e:
+        app.logger.error("Sweep: Razorpay API error: %s", e)
+        return jsonify({"error": "razorpay unavailable"}), 502
+
+    from delivery import send_preset_email
+    delivered, already_done = [], 0
+    for link in links:
+        if link.get("status") != "paid":
+            continue
+        link_id = link.get("id", "")
+        if not link_id or _already_delivered(link_id):
+            already_done += 1
+            continue
+        # The buyer types their contact on Razorpay's payment page (the step
+        # right after our email box). Pull the full link detail so we capture
+        # that contact alongside the email for tracking/reconciliation.
+        customer = link.get("customer") or {}
+        pay_ids = link.get("payments") or []
+        try:
+            d = requests.get(
+                "https://api.razorpay.com/v1/payment_links/" + link_id,
+                auth=auth, timeout=30,
+            )
+            detail = d.json() if d.ok else {}
+        except requests.RequestException:
+            detail = {}
+        d_customer = detail.get("customer") or {}
+        if d_customer.get("email"):
+            customer = d_customer
+        pay_ids = detail.get("payments") or pay_ids
+        contact = d_customer.get("contact") or customer.get("contact") or ""
+        # Last resort: the payment entity always carries the payer's contact.
+        if not contact and pay_ids:
+            try:
+                p = requests.get(
+                    "https://api.razorpay.com/v1/payments/" + pay_ids[0],
+                    auth=auth, timeout=30,
+                )
+                if p.ok:
+                    contact = p.json().get("contact") or ""
+            except requests.RequestException:
+                pass
+        notes = link.get("notes") or {}
+        product_id = str(notes.get("product_id", ""))
+        customer_email = customer.get("email", "")
+        if product_id not in PRODUCTS or not customer_email:
+            app.logger.warning("Sweep: missing product/email on %s", link_id)
+            continue  # not marked delivered; retried on the next sweep
+        try:
+            product = PRODUCTS[product_id]
+            download_url = build_download_url(customer_email, product_id)
+            send_preset_email(customer_email, product["name"], download_url)
+            _mark_delivered(link_id)
+            delivered.append({
+                "link": link_id,
+                "product": product["name"],
+                "email": customer_email,
+                "phone": contact or str(notes.get("phone", "")),
+            })
+            app.logger.info(
+                "Sweep delivered %s to %s (%s)",
+                product["name"], customer_email, link_id,
+            )
+        except Exception as e:
+            app.logger.error("Sweep delivery failed for %s: %s", link_id, e)
+    return jsonify({
+        "status": "ok",
+        "checked": len(links),
+        "delivered": delivered,
+        "already_done": already_done,
+    })
+
 
 # --- Secure download links ---
 DOWNLOAD_LINK_TTL_SECONDS = 7 * 24 * 3600  # 7 days
