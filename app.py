@@ -4,7 +4,8 @@ Generates fresh Razorpay payment links and auto-delivers presets via email.
 
 Endpoints:
   POST /generate-link  {product_id, email} -> {payment_link}
-  POST /webhook        Razorpay payment_link.paid events -> sends preset email
+  POST /webhook        Razorpay payment events -> sends preset email instantly
+                       (payment_link.paid and payment.captured)
   GET  /download/<token>  time-limited secure preset download
   GET  /health
 """
@@ -286,9 +287,51 @@ def generate_link():
         return jsonify({"error": "Could not generate payment link"}), 500
 
 
+def _handle_payment_captured(event):
+    """Deliver the preset instantly on Razorpay payment.captured webhooks."""
+    try:
+        pay = ((event.get("payload") or {}).get("payment") or {}).get("entity") or {}
+        pay_id = pay.get("id", "")
+        amount_paise = int(pay.get("amount") or 0)
+        # Fully refunded payments need no delivery.
+        if amount_paise and int(pay.get("amount_refunded") or 0) >= amount_paise:
+            return jsonify({"status": "refunded_ignored"}), 200
+        if not pay_id:
+            return jsonify({"status": "missing_data"}), 200
+        # Idempotency: the sweep keys off the same payment id, so a webhook
+        # delivery and a sweep run can never double-send.
+        if _already_delivered(pay_id):
+            app.logger.info("Duplicate payment.captured ignored for %s", pay_id)
+            return jsonify({"status": "duplicate_ignored"}), 200
+        notes = pay.get("notes") or {}
+        product_id = str(notes.get("product_id") or "")
+        customer_email = (pay.get("email") or "").strip() or str(notes.get("email") or "")
+        if product_id not in PRODUCTS and customer_email and amount_paise:
+            rec = _find_generated_record(customer_email, amount_paise)
+            if rec:
+                product_id = rec.get("product_id", "")
+        if product_id not in PRODUCTS or not customer_email:
+            app.logger.error("payment.captured unmappable: %s", pay_id)
+            # Leave unmarked so the sweep can retry once notes/records exist.
+            return jsonify({"status": "missing_data"}), 200
+        product = PRODUCTS[product_id]
+        from delivery import send_preset_email
+        download_url = build_download_url(customer_email, product_id)
+        send_preset_email(customer_email, product["name"], download_url)
+        _mark_delivered(pay_id)
+        app.logger.info(
+            "Delivered %s to %s (payment %s) via payment.captured",
+            product["name"], customer_email, pay_id,
+        )
+        return jsonify({"status": "delivered"}), 200
+    except Exception as e:
+        app.logger.error("payment.captured webhook error: %s", e)
+        return jsonify({"error": "Delivery failed"}), 500
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Handle Razorpay payment_link.paid events and deliver the preset."""
+    """Handle Razorpay payment events and deliver the preset instantly."""
     # Verify webhook signature
     if RAZORPAY_WEBHOOK_SECRET:
         signature = request.headers.get("X-Razorpay-Signature", "")
@@ -300,8 +343,15 @@ def webhook():
             return jsonify({"error": "Invalid signature"}), 401
 
     event = request.get_json(force=True, silent=True) or {}
-    if event.get("event") != "payment_link.paid":
+    event_name = event.get("event")
+    if event_name not in ("payment_link.paid", "payment.captured"):
         return jsonify({"status": "ignored"}), 200
+
+    # payment.captured is the instant path for UPI/card payments: Razorpay
+    # copies the payment link's notes onto the payment entity, so the same
+    # product/email mapping the sweep uses applies here.
+    if event_name == "payment.captured":
+        return _handle_payment_captured(event)
 
     try:
         pl = event["payload"]["payment_link"]["entity"]
