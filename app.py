@@ -131,6 +131,15 @@ def _find_generated_record(email, amount_paise):
             return rec
     return None
 
+
+def _real_email(raw):
+    """Normalize a buyer email. Razorpay sends void@razorpay.com when the
+    payer provided no email address; treat that placeholder as missing so
+    the payment lands in skipped/missing-data instead of being emailed
+    into a black hole and marked delivered."""
+    email = (raw or "").strip()
+    return "" if email.lower() == "void@razorpay.com" else email
+
 # Product ID -> {name, amount_inr, file}
 # Amounts in INR (must match Shopify India market prices)
 PRODUCTS = {
@@ -305,7 +314,7 @@ def _handle_payment_captured(event):
             return jsonify({"status": "duplicate_ignored"}), 200
         notes = pay.get("notes") or {}
         product_id = str(notes.get("product_id") or "")
-        customer_email = (pay.get("email") or "").strip() or str(notes.get("email") or "")
+        customer_email = _real_email(pay.get("email")) or _real_email(notes.get("email"))
         if product_id not in PRODUCTS and customer_email and amount_paise:
             rec = _find_generated_record(customer_email, amount_paise)
             if rec:
@@ -357,7 +366,7 @@ def webhook():
         pl = event["payload"]["payment_link"]["entity"]
         notes = pl.get("notes", {})
         product_id = str(notes.get("product_id", ""))
-        customer_email = pl.get("customer", {}).get("email", "")
+        customer_email = _real_email(pl.get("customer", {}).get("email", ""))
         payment_id = pl.get("id", "")
         # The actual Razorpay payment id (sweeper keys off this).
         pay_entity = (event["payload"].get("payment") or {}).get("entity") or {}
@@ -540,7 +549,7 @@ def sweep():
         # Fallback: the generated_links.json record matched on email + amount.
         notes = p.get("notes") or {}
         product_id = str(notes.get("product_id") or "")
-        customer_email = (p.get("email") or "").strip() or str(notes.get("email") or "")
+        customer_email = _real_email(p.get("email")) or _real_email(notes.get("email"))
         contact = p.get("contact") or ""
         link_id = ""
         if product_id not in PRODUCTS and customer_email and amount_paise:
