@@ -2,12 +2,14 @@
 UPI Payment Backend for Sutej Pannu Presets
 Generates fresh Razorpay payment links and auto-delivers presets via email.
 
+
 Endpoints:
   POST /generate-link  {product_id, email} -> {payment_link}
   POST /webhook        Razorpay payment_link.paid events -> sends preset email
   GET  /download/<token>  time-limited secure preset download
   GET  /health
 """
+
 
 import os
 import hmac
@@ -21,6 +23,7 @@ from requests.auth import HTTPBasicAuth
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+
 app = Flask(__name__)
 
 # CORS: allow the Showit/Shopify storefront to call the API from the browser
@@ -31,19 +34,23 @@ def _cors(response):
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
 
+
 @app.route("/generate-link", methods=["OPTIONS"])
 @app.route("/webhook", methods=["OPTIONS"])
 def _cors_preflight():
     return ("", 204)
+
 
 # Config from environment
 RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
 RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
 
+
 # In-memory set of processed Razorpay payment-link IDs (idempotency).
 # NOTE: resets on restart; use Redis/DB for multi-instance production.
 _processed_payments = set()
+
 
 # Product ID -> {name, amount_inr, file}
 # Amounts in INR (must match Shopify India market prices)
@@ -67,7 +74,6 @@ PRODUCTS = {
 
 
 
-
 # Coupon codes: code -> discount percentage
 # In production, these could come from environment variables or a database
 # THANKYOU2026: keep until its Shopify expiry (Sept 27, 2026 ~9:30 AM PDT), then remove
@@ -75,7 +81,6 @@ PRODUCTS = {
 }
 
 PRESET_DIR = os.path.join(os.path.dirname(__file__), "preset-packs")
-
 
 
 COUPONS = {
@@ -92,13 +97,10 @@ _used_one_time_coupons = set()
 
 
 
-
 @app.route("/generate-link", methods=["POST"])
 def generate_link():
     """Generate a fresh Razorpay payment link for a preset purchase."""
     data = request.get_json(force=True, silent=True) or {}
-
-
 
 
 
@@ -232,12 +234,11 @@ def health():
     return jsonify({"status": "ok"})
 
 
-
 # --- Tracker payments proxy ---
 # Lets the Clicker App tracker read today's successful UPI payments without
 # opening the Razorpay dashboard in a browser (which triggers a per-task
 # approval prompt on Sutej's phone every 15 minutes). Read-only: proxies the
-# Razorpay Payment Links API using the server's own API keys.
+# Razorpay Payments + Payment Links APIs using the server's own API keys.
 # Guarded by the TRACKER_KEY env var (shared secret with the tracker).
 TRACKER_KEY = os.environ.get("TRACKER_KEY", "")
 TRACKER_TZ = ZoneInfo("America/Los_Angeles")
@@ -256,72 +257,59 @@ def tracker_payments():
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     day_start_ts = int(day_start.timestamp())
     now_ts = int(now.timestamp())
-    week_ago_ts = day_start_ts - 6 * 86400
+    week_ago_ts = day_start_ts - 6 * 86400  # catch links created earlier, paid today
 
-    try:
-        links_resp = requests.get(
-            "https://api.razorpay.com/v1/payment_links",
-            auth=auth,
-            params={"from": week_ago_ts, "to": now_ts, "count": 100},
-            timeout=30,
-        )
-        links_resp.raise_for_status()
-        items = links_resp.json().get("items", [])
-    except requests.RequestException as e:
-        app.logger.error("Razorpay payment_links fetch failed: %s", e)
-        return jsonify({"error": "razorpay api unavailable"}), 502
-
-    def _get_payment(pid):
+    def _api_get(url, params):
         try:
-            pr = requests.get(
-                f"https://api.razorpay.com/v1/payments/{pid}",
-                auth=auth,
-                timeout=30,
-            )
-            pr.raise_for_status()
-            return pr.json()
+            r = requests.get(url, auth=auth, params=params, timeout=30)
+            r.raise_for_status()
+            return r.json()
         except requests.RequestException as e:
-            app.logger.error("Razorpay payment fetch failed %s: %s", pid, e)
+            app.logger.error("Razorpay API failed %s: %s", url, e)
             return None
 
-    def _link_payment_ids(link):
-        pay_ids = link.get("payments") or []
-        if pay_ids or link.get("status") != "paid":
-            return pay_ids
-        try:
-            lr = requests.get(
-                f"https://api.razorpay.com/v1/payment_links/{link.get('id')}",
-                auth=auth,
-                timeout=30,
-            )
-            lr.raise_for_status()
-            return lr.json().get("payments") or []
-        except requests.RequestException as e:
-            app.logger.error("Razorpay payment_link detail failed: %s", e)
-            return []
+    # Map payment_id -> preset name via recent payment links (built by /generate-link).
+    pay_to_item = {}
+    links_data = _api_get(
+        "https://api.razorpay.com/v1/payment_links",
+        {"from": week_ago_ts, "to": now_ts, "count": 100},
+    )
+    if links_data:
+        for link in links_data.get("items", []):
+            pay_ids = link.get("payments") or []
+            if not pay_ids and link.get("status") == "paid" and link.get("id"):
+                detail = _api_get(
+                    "https://api.razorpay.com/v1/payment_links/" + link["id"], {}
+                )
+                pay_ids = (detail or {}).get("payments") or []
+            notes = link.get("notes", {}) or {}
+            name = notes.get("product_name") or link.get("description") or "Preset"
+            for pid in pay_ids:
+                pay_to_item[pid] = name
+
+    # Today's captured payments (mirrors the dashboard payments view).
+    pays_data = _api_get(
+        "https://api.razorpay.com/v1/payments",
+        {"from": day_start_ts, "to": now_ts, "count": 100},
+    )
+    if pays_data is None:
+        return jsonify({"error": "razorpay api unavailable"}), 502
 
     payments = []
-    for link in items:
-        if link.get("status") != "paid":
+    for p in pays_data.get("items", []):
+        if p.get("status") != "captured":
             continue
-        notes = link.get("notes", {}) or {}
-        item_name = notes.get("product_name") or link.get("description") or "Preset"
-        for pid in _link_payment_ids(link):
-            p = _get_payment(pid)
-            if not p or p.get("status") != "captured":
-                continue
-            created = int(p.get("created_at", 0))
-            if created < day_start_ts:
-                continue
-            dt = datetime.fromtimestamp(created, TRACKER_TZ)
-            payments.append({
-                "time": dt.strftime("%H:%M"),
-                "payment_id": p.get("id", ""),
-                "item": item_name,
-                "amount": (p.get("amount") or 0) // 100,
-                "status": p.get("status", ""),
-                "created_at": created,
-            })
+        pid = p.get("id", "")
+        created = int(p.get("created_at", 0))
+        dt = datetime.fromtimestamp(created, TRACKER_TZ)
+        payments.append({
+            "time": dt.strftime("%H:%M"),
+            "payment_id": pid,
+            "item": pay_to_item.get(pid) or p.get("description") or "UPI payment",
+            "amount": (p.get("amount") or 0) // 100,
+            "status": p.get("status", ""),
+            "created_at": created,
+        })
 
     payments.sort(key=lambda x: x["created_at"])
     return jsonify({
@@ -330,6 +318,7 @@ def tracker_payments():
         "total_inr": sum(x["amount"] for x in payments),
         "payments": payments,
     })
+
 # --- Secure download links ---
 DOWNLOAD_LINK_TTL_SECONDS = 7 * 24 * 3600  # 7 days
 
@@ -386,8 +375,6 @@ def download_preset(token):
         return jsonify({"error": "File not available"}), 404
     app.logger.info("Download served: %s -> %s", product["file"], email)
     return send_file(filepath, as_attachment=True, download_name=product["file"])
-
-
 
 
 
