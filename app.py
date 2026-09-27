@@ -329,10 +329,10 @@ def tracker_payments():
     pay_to_contact = {}
     links_data = _api_get(
         "https://api.razorpay.com/v1/payment_links",
-        {"from": week_ago_ts, "to": now_ts, "count": 100},
+        {"count": 100},
     )
     if links_data:
-        for link in links_data.get("items", []):
+        for link in [l for l in links_data.get("items", []) if week_ago_ts <= int(l.get("created_at", 0) or 0) <= now_ts]:  # client-side date filter: list API ignores from/to
             pay_ids = link.get("payments") or []
             detail = None
             if not pay_ids and link.get("status") == "paid" and link.get("id"):
@@ -405,11 +405,11 @@ def sweep():
         resp = requests.get(
             "https://api.razorpay.com/v1/payment_links",
             auth=auth,
-            params={"from": from_ts, "to": now_ts, "count": 100},
+            params={"count": 100},
             timeout=30,
         )
         resp.raise_for_status()
-        links = resp.json().get("items", [])
+        links = [l for l in resp.json().get("items", []) if from_ts <= int(l.get("created_at", 0) or 0) <= now_ts]  # client-side filter: list API ignores from/to
     except requests.RequestException as e:
         app.logger.error("Sweep: Razorpay API error: %s", e)
         return jsonify({"error": "razorpay unavailable"}), 502
